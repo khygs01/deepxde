@@ -6,7 +6,7 @@ from .. import initializers
 from .. import regularizers
 from ... import config
 from ...backend import tf
-from ...utils import timing
+from ...utils import make_dict, timing
 
 
 class FNN(NN):
@@ -272,3 +272,226 @@ class PFNN(FNN):
 
         self.y_ = tf.placeholder(config.real(tf), [None, self.layer_size[-1]])
         self.built = True
+
+
+class FSFNN(FNN):
+    """Free Surface FNN"""
+
+    def __init__(
+        self,
+        layer_sizes,
+        activation,
+        kernel_initializer,
+        regularization=None,
+        dropout_rate=0,
+        batch_normalization=None,
+    ):
+        super().__init__(
+            layer_sizes,
+            activation,
+            kernel_initializer,
+            regularization,
+            dropout_rate,
+            batch_normalization,
+        )
+        self.layer_size_xy = layer_sizes[0]
+        self.layer_size_uvp = layer_sizes[1]
+        self._input_transform_xy = None
+        self._input_transform_uvp = None
+        self._output_transform_xy = None
+        self._output_transform_uvp = None
+
+    @property
+    def outputs_xy(self):
+        # tensor
+        return self.xy
+
+    @property
+    def targets_xy(self):
+        # placeholder
+        return self.xy_
+
+    @property
+    def inputs_db(self):
+        # placeholder
+        return self.x_db
+
+    @property
+    def outputs_xy_db(self):
+        # tensor
+        return self.xy_db
+
+    @property
+    def outputs_db(self):
+        return self.y_db
+
+    def _dense(self, units, activation=None, use_bias=True):
+        # overwritten to allow reusing the network parameters
+        return [
+            (tf.layers.Dense(units, activation=activation, use_bias=use_bias), "dense")
+        ]
+
+    def _dense_batchnorm_v1(self, units):
+        # FC - BN - activation
+        layer = self._dense(units, use_bias=False)
+        layer += [(tf.layers.BatchNormalization(), "batchnorm")]
+        return layer
+
+    def _dense_batchnorm_v2(self, units):
+        # FC - activation - BN
+        layer = self._dense(units, activation=self.activation)
+        layer += [(tf.layers.BatchNormalization(), "batchnorm")]
+        return layer
+
+    @timing
+    def build(self):
+        print("Building feed-forward neural network...")
+        # xi in computational domain (tf.placeholder)
+        self.x = tf.placeholder(config.real(tf), [None, self.layer_size_xy[0]])
+        # for ntks
+        self.xieta_ntk = None
+        self.xy_ntk = None
+        self.uvp_ntk = None
+        # for flow rate boundary
+        self.xei = None
+        self.xef = None
+        # for domain boundary
+        self.x_db = {}  # xieta
+        self.xy_db = {}  # xy
+        self.y_db = {}  # uvp
+
+        # define layers (to be shared between self.x and self.x_db)
+        layers_xy = self._build_layers(self.layer_size_xy)
+        layers_uvp = self._build_layers(self.layer_size_uvp)
+        self.layers_xy = layers_xy
+        self.layers_uvp = layers_uvp
+
+        # build net
+        self.xy, self.y = self.build_net(self.x)
+
+        # placeholder for exact value of xy
+        self.xy_ = tf.placeholder(config.real(tf), [None, self.layer_size_xy[-1]])
+        # placeholder for exact value of uvp
+        self.y_ = tf.placeholder(config.real(tf), [None, self.layer_size_uvp[-1]])
+        self.built = True
+
+    def build_net(self, x):
+        # build net_xy
+        x_ = x
+        # x in physical domain (tf.tensor)
+        x_ = self._build_net(
+            x_,
+            self.layers_xy,
+            self._input_transform_xy,
+            self._output_transform_xy,
+            skip=True if len(self.layers_xy) != 1 else False,
+        )
+        xy = x_
+
+        # build net_uvp
+        x_ = xy
+        # uvp in physical domain (tf.tensor)
+        x_ = self._build_net(
+            x_,
+            self.layers_uvp,
+            self._input_transform_uvp,
+            self._output_transform_uvp,
+        )
+        uvp = x_
+        return xy, uvp
+
+    def _build_net(
+        self, x, layers, input_transform=None, output_transform=None, skip=False
+    ):
+        x_ = x
+        if input_transform is not None:
+            x_ = input_transform(x_)
+        x_ = self._forward(x_, layers)
+        if skip:
+            x_ += x  # skip connection
+        if output_transform is not None:
+            x_ = output_transform(x, x_)
+        return x_
+
+    def _build_layers(self, layer_size):
+        if len(layer_size) == 2:
+            if layer_size[0] != layer_size[1]:
+                raise ValueError(
+                    "if len(layer_size) == 2, input and output sizes must be equal!"
+                )
+            return [(tf.identity, "identity")]
+
+        def layer_map(layer_size, net):
+            if net.batch_normalization is None:
+                layer = net._dense(layer_size, activation=net.activation)
+            elif net.batch_normalization == "before":
+                layer = net._dense_batchnorm_v1(layer_size)
+            elif net.batch_normalization == "after":
+                layer = net._dense_batchnorm_v2(layer_size)
+            else:
+                raise ValueError("batch_normalization")
+            if net.dropout_rate > 0:
+                layer = [(tf.layers.Dropout(rate=net.dropout_rate), "dropout")]
+            return layer
+
+        # hidden layers
+        layers = []
+        for i in range(len(layer_size) - 2):
+            layers += layer_map(layer_size[i + 1], self)
+        # output layer
+        layers += self._dense(layer_size[-1])
+
+        return layers
+
+    def _forward(self, x, layers):
+        for layer, layer_type in layers:
+            if layer_type in ["dense", "identity"]:
+                x = layer(x)
+            else:
+                x = layer(x, self.training)
+        return x
+
+    def feed_dict(
+        self,
+        training,
+        inputs,
+        targets=None,
+        targets_xy=None,
+    ):
+        """Construct a feed_dict to feed values to TensorFlow placeholders."""
+        feed_dict = {self.training: training}
+        feed_dict.update(self._feed_dict_inputs(inputs))
+        if targets is not None:
+            feed_dict.update(self._feed_dict_targets(targets))
+        if targets_xy is not None:
+            feed_dict.update(self._feed_dict_targets_xy(targets_xy))
+        return feed_dict
+
+    def _feed_dict_inputs(self, inputs):
+        return make_dict(self.inputs, inputs)
+
+    def _feed_dict_inputs_db(self, inputs_db, db_idx):
+        return make_dict(self.inputs_db[db_idx], inputs_db)
+
+    def _feed_dict_targets(self, targets):
+        return make_dict(self.targets, targets)
+
+    def _feed_dict_targets_xy(self, targets_xy):
+        return make_dict(self.targets_xy, targets_xy)
+
+    def _feed_dict_inputs_qline(self, xei, xef):
+        return make_dict([self.xei, self.xef], [xei, xef])
+
+    def apply_output_transform(self, transforms):
+        """Apply a transform to the network outputs, i.e.,
+        outputs = transform(inputs, outputs).
+        """
+        self._output_transform_xy = transforms[0]
+        self._output_transform_uvp = transforms[1]
+
+    def apply_feature_transform(self, transforms):
+        """Compute the features by appling a transform to the network inputs, i.e.,
+        features = transform(inputs). Then, outputs = network(features).
+        """
+        self._input_transform_xy = transforms[0]
+        self._input_transform_uvp = transforms[1]

@@ -10,6 +10,9 @@ import scipy.spatial.distance
 from mpl_toolkits.mplot3d import Axes3D
 from sklearn import preprocessing
 
+import json
+from six.moves import cPickle as pickle
+
 
 class PointSet:
     """A set of points.
@@ -211,7 +214,7 @@ def plot_loss_history(loss_history, fname=None):
         plt.savefig(fname)
 
 
-def save_loss_history(loss_history, fname):
+def save_loss_history(loss_history, fname, weights=False):
     """Save the training and testing loss history to a file."""
     print("Saving loss history to {} ...".format(fname))
     loss = np.hstack(
@@ -222,7 +225,11 @@ def save_loss_history(loss_history, fname):
             np.array(loss_history.metrics_test),
         )
     )
-    np.savetxt(fname, loss, header="step, loss_train, loss_test, metrics_test")
+    header = "step, loss_train, loss_test, metrics_test"
+    if weights:
+        loss = np.hstack((loss, np.array(loss_history.loss_weights_record)))
+        header += ", loss_weights"
+    np.savetxt(fname, loss, header=header)
 
 
 def _pack_data(train_state):
@@ -374,3 +381,20 @@ def dat_to_csv(dat_file_path, csv_file_path, columns):
                 continue
             row = [field.strip() for field in line.split(" ")]
             csv_writer.writerow(row)
+
+
+def save(savedir, timestamp, picklable=None, dictlike=None, name="args"):
+    print("Saving arguments to {}".format(savedir))
+    if dictlike is not None:
+        with open(savedir + "{}_{}.json".format(name, timestamp), "w") as f:
+            json.dump(dictlike, f)
+    if picklable is not None:
+        with open(savedir + "{}_{}.pkl".format(name, timestamp), "wb") as f:
+            pickle.dump(picklable, f)
+
+
+def load(pathtofile):
+    print("Loading arguments from {}".format(pathtofile))
+    with open(pathtofile, "rb") as f:
+        params = pickle.load(f)
+    return params

@@ -3,6 +3,7 @@
 __all__ = [
     "BC",
     "DirichletBC",
+    "DirichletBC_xy",
     "NeumannBC",
     "OperatorBC",
     "PeriodicBC",
@@ -79,6 +80,23 @@ class DirichletBC(BC):
         return outputs[beg:end, self.component : self.component + 1] - values
 
 
+class DirichletBC_xy(BC):
+    """Dirichlet boundary conditions: y(x) = func(x)."""
+
+    def __init__(self, geom, func, on_boundary, component=0):
+        super().__init__(geom, on_boundary, component)
+        self.func = npfunc_range_autocache(utils.return_tensor(func))
+
+    def error(self, X, inputs, outputs, beg, end, xy):
+        values = self.func(X, beg, end, xy)
+        if bkd.ndim(values) == 2 and bkd.shape(values)[1] != 1:
+            raise RuntimeError(
+                "DirichletBC function should return an array of shape N by 1 for each "
+                "component. Use argument 'component' for different output components."
+            )
+        return xy[beg:end, self.component : self.component + 1] - values
+
+
 class NeumannBC(BC):
     """Neumann boundary conditions: dy/dn(x) = func(x)."""
 
@@ -133,6 +151,50 @@ class PeriodicBC(BC):
         return yleft - yright
 
 
+class SharedBdryBC(BC):
+    def __init__(self, geom, on_boundary, component=None):
+        # geom should be an instance of ``CSGIntersection``
+        super().__init__(geom, on_boundary, component)
+
+    @abstractmethod
+    def error(self, X, xieta0, xieta1, xy0, xy1, uvp0, uvp1, beg, end):
+        """Returns the loss."""
+
+
+class SharedBdryXYBC(SharedBdryBC):
+    def __init__(self, geom, on_boundary, component):
+        super().__init__(geom, on_boundary, component)
+
+    def error(self, X, xieta0, xieta1, xy0, xy1, uvp0, uvp1, beg, end):
+        return (
+            xy0[beg:end, self.component : self.component + 1]
+            - xy1[beg:end, self.component : self.component + 1]
+        )
+
+
+class SharedBdryUVPBC(SharedBdryBC):
+    def __init__(self, geom, on_boundary, component):
+        super().__init__(geom, on_boundary, component)
+
+    def error(self, X, xieta0, xieta1, xy0, xy1, uvp0, uvp1, beg, end):
+        return (
+            uvp0[beg:end, self.component : self.component + 1]
+            - uvp1[beg:end, self.component : self.component + 1]
+        )
+
+
+class SharedBdryResidualBC(SharedBdryBC):
+    def __init__(self, geom, on_boundary, func):
+        super().__init__(geom, on_boundary)
+        self.func = func  # pde
+
+    def error(self, X, xieta0, xieta1, xy0, xy1, uvp0, uvp1, beg, end):
+        return (
+            self.func(xieta0, uvp0, xy0)[beg:end]
+            - self.func(xieta1, uvp1, xy1)[beg:end]
+        )
+
+
 class OperatorBC(BC):
     """General operator boundary conditions: func(inputs, outputs, X) = 0.
 
@@ -158,6 +220,98 @@ class OperatorBC(BC):
 
     def error(self, X, inputs, outputs, beg, end, aux_var=None):
         return self.func(inputs, outputs, X)[beg:end]
+
+
+class OperatorBC_uvpxy(BC):
+    """General operator boundary conditions: func(xieta, uvp, xy) = 0."""
+
+    def __init__(self, geom, func, on_boundary):
+        super().__init__(geom, on_boundary, None)
+        self.func = func
+
+    def error(self, X, xieta, uvp, beg, end, xy):
+        return self.func(xieta, uvp, xy)[beg:end]
+
+
+class FlowRateBC:
+    """
+    Assure flow rate values along specified lines. To be used with `FlowrateBdry` data class.
+    Supports dim == 2 only.
+    """
+
+    def __init__(self, Q, N_quad, quad_method="legendre"):
+        self.Q = Q  # specified flow rate
+        self.N = N_quad  # number of quadrature points
+        # quadrature method (legendre: Gauss-Legendre, lobatto: Gauss-Lobatto)
+        self.quad = {
+            "legendre": self.GaussLegendreQuadrature,
+            "lobatto": self.GaussLobattoQuadrature,
+        }[quad_method]
+        if backend_name not in ["tensorflow.compat.v1", "tensorflow"]:
+            raise NotImplementedError(
+                "Currently only tensorflow.compat.v1, and tensorflow supported"
+            )
+
+    def GaussLegendreQuadrature(self):
+        from scipy.special import roots_legendre
+
+        X, W = roots_legendre(self.N)
+        return X, W
+
+    def GaussLobattoQuadrature(self):
+        from scipy.special import roots_jacobi, legendre
+
+        N = self.N
+        if N <= 1:
+            raise ValueError("There must be more than 1 quadrature points!")
+        W = []
+        X, _ = roots_jacobi(N - 2, 1, 1)
+        wl = wr = 2 / (N * (N - 1))
+        w = 2 / (N * (N - 1) * legendre(N - 1)(X) ** 2)
+        X = np.insert(X, [0, len(X)], [-1, 1])
+        W = np.insert(w, [0, len(w)], [wl, wr])
+        return X, W
+
+    def error(self, xei, xef, net):
+        from ..backend import tf
+
+        xyi = net._build_net(
+            xei,
+            net.layers_xy,
+            net._input_transform_xy,
+            net._output_transform_xy,
+            skip=True,
+        )  # shape = (M, 2)
+        xyf = net._build_net(
+            xef,
+            net.layers_xy,
+            net._input_transform_xy,
+            net._output_transform_xy,
+            skip=True,
+        )  # shape = (M, 2)
+        xi, yi = xyi[:, 0:1], xyi[:, 1:]
+        xf, yf = xyf[:, 0:1], xyf[:, 1:]
+        # dxy = xyf - xyi  # shape = (M, 2)
+        # dx, dy = dxy[:, 0], dxy[:, 1]  # shape = (M,)
+        dx = xf - xi  # shape = (M, 1)
+        dy = yf - yi
+        dS = tf.sqrt(dx**2 + dy**2)  # shape = (M,)
+        nx, ny = dy / dS, -dx / dS  # shape = (M,)
+        pts, W = self.quad()  # shape = (N,)
+        # xy = xyi + dxy * (pts + 1) / 2  # shape = (M, 2, N), from (-1, 1) to (xyi, xyf)
+        x = xi + dx * (pts + 1) / 2  # shape = (M, N), from (-1, 1) to (xi, xf)
+        y = yi + dy * (pts + 1) / 2
+        xy = tf.stack((x, y), axis=-1)  # shape = (M, N, 2)
+        # xy = tf.transpose(xy, [0, 2, 1])  # shape = (M, N, 2)
+        uvp = net._build_net(
+            xy, net.layers_uvp, net._input_transform_uvp, net._output_transform_uvp
+        )  # shape = (M, N, 3)
+        uv_n = nx * uvp[..., 0] + ny * uvp[..., 1]  # shape = (M, N)
+        J = dS / 2  # shape = (M,)
+        q_pred = J * tf.matmul(
+            uv_n, W[:, np.newaxis]
+        )  # (M, 1) * ((M, N) x (N, 1)) = (M, 1)
+        return q_pred - self.Q
 
 
 class PointSetBC:
@@ -186,7 +340,7 @@ class PointSetBC:
         self.component = component
         self.batch_size = batch_size
 
-        if batch_size is not None: # batch iterator and state
+        if batch_size is not None:  # batch iterator and state
             if backend_name != "pytorch":
                 raise RuntimeError("batch_size only implemented for pytorch backend")
             self.batch_sampler = data.sampler.BatchSampler(len(self), shuffle=shuffle)

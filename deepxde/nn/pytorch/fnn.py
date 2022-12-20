@@ -139,3 +139,47 @@ class PFNN(NN):
         if self._output_transform is not None:
             x = self._output_transform(inputs, x)
         return x
+
+
+class FSFNN(NN):
+    """Free Surface FNN"""
+
+    def __init__(self, layer_sizes, activation, kernel_initializer):
+        super().__init__()
+        self.activation = activations.get(activation)
+        self.initializer = initializers.get(kernel_initializer)
+        self.initializer_zero = initializers.get("zeros")
+        self.layer_size_xy = layer_sizes[0]
+        self.layer_size_uvp = layer_sizes[1]
+
+        self.linears_xy = torch.nn.ModuleList()
+        self.linears_uvp = torch.nn.ModuleList()
+        self._build_layers(self.layer_size_xy, self.linears_xy)
+        self._build_layers(self.layer_size_uvp, self.linears_uvp)
+
+    def _build_layers(self, layer_sizes, moduleList):
+        for i in range(1, len(layer_sizes)):
+            moduleList.append(
+                torch.nn.Linear(
+                    layer_sizes[i - 1], layer_sizes[i], dtype=config.real(torch)
+                )
+            )
+            self.initializer(moduleList[-1].weight)
+            self.initializer_zero(moduleList[-1].bias)
+
+    def forward(self, inputs):
+        x = inputs
+        if self._input_transform is not None:
+            x = self._input_transform(x)
+        for linear in self.linears_xy[:-1]:
+            x = self.activation(linear(x))
+        x = self.linears_xy[-1](x)
+        x += inputs  # skip connection
+        xy = x
+        for linear in self.linears_uvp[:-1]:
+            x = self.activation(linear(x))
+        x = self.linears_uvp[-1](x)
+        if self._output_transform is not None:
+            x = self._output_transform(inputs, x)
+        uvp = x
+        return xy, uvp

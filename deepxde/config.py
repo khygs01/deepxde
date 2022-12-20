@@ -8,7 +8,7 @@ from .backend import backend_name, tf, torch, paddle
 from .real import Real
 
 # Default float type
-real = Real(32)
+real = Real(64)
 # Random seed
 random_seed = None
 if backend_name == "jax":

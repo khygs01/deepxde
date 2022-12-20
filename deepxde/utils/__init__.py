@@ -7,6 +7,7 @@ from . import array_ops_compat
 from .external import *
 from .internal import *
 from ..backend import backend_name
+from .plot import *
 
 
 def _load_backend(mod_name):

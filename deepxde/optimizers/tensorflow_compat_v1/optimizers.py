@@ -67,6 +67,10 @@ def _get_learningrate(lr, decay):
         lr = tf.train.inverse_time_decay(lr, global_step, decay[1], decay[2])
     elif decay[0] == "cosine":
         lr = tf.train.cosine_decay(lr, global_step, decay[1], alpha=decay[2])
+    elif decay[0] == "exponential":
+        lr = tf.train.exponential_decay(
+            lr, global_step, decay_steps=decay[1], decay_rate=decay[2], staircase=False
+        )
     else:
         raise NotImplementedError(
             f"{decay[0]} decay to be implemented for backend tensorflow.compat.v1."

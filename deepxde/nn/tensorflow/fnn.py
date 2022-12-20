@@ -3,6 +3,7 @@ from .. import activations
 from .. import initializers
 from .. import regularizers
 from ...backend import tf
+from ... import config
 
 
 class FNN(NN):
@@ -160,3 +161,68 @@ class PFNN(NN):
         if self._output_transform is not None:
             y = self._output_transform(inputs, y)
         return y
+
+
+class FSFNN(FNN):
+    """Free Surface FNN"""
+
+    def __init__(
+        self,
+        layer_sizes,
+        activation,
+        kernel_initializer,
+        regularization=None,
+        dropout_rate=0,
+    ):
+        NN.__init__(self)
+        tf.keras.Model.__init__(self, dtype=config.real(tf))
+        self.layer_size_xy = layer_sizes[0]
+        self.layer_size_uvp = layer_sizes[1]
+        self.regularizer = regularizers.get(regularization)
+        self.activation = activations.get(activation)
+        self.initializer = initializers.get(kernel_initializer)
+        self.dropout_rate = dropout_rate
+
+        self.denses_xy = self._build_layers(self.layer_size_xy)
+        self.denses_uvp = self._build_layers(self.layer_size_uvp)
+
+    def _build_layers(self, layer_sizes):
+        denses = []
+        # hidden layers
+        for units in layer_sizes[1:-1]:
+            denses.append(
+                tf.keras.layers.Dense(
+                    units,
+                    activation=self.activation,
+                    kernel_initializer=self.initializer,
+                    kernel_regularizer=self.regularizer,
+                    dtype=config.real(tf),
+                )
+            )
+            if self.dropout_rate > 0:
+                denses.append(tf.keras.layers.Dropout(rate=self.dropout_rate))
+        # output layer
+        denses.append(
+            tf.keras.layers.Dense(
+                layer_sizes[-1],
+                kernel_initializer=self.initializer,
+                kernel_regularizer=self.regularizer,
+                dtype=config.real(tf),
+            )
+        )
+        return denses
+
+    def call(self, inputs, training=False):
+        y = inputs
+        if self._input_transform is not None:
+            y = self._input_transform(y)
+        for f in self.denses_xy:
+            y = f(y, training=training)
+        y += inputs  # skip connection
+        xy = y
+        for f in self.denses_uvp:
+            y = f(y, training=training)
+        if self._output_transform is not None:
+            y = self._output_transform(inputs, y)
+        uvp = y
+        return xy, uvp

@@ -178,7 +178,7 @@ class ExternalOptimizerInterface:
         initial_packed_var_val = session.run(self._packed_var)
 
         # Perform minimization.
-        packed_var_val = self._minimize(
+        packed_var_val, res = self._minimize(
             initial_val=initial_packed_var_val,
             loss_grad_func=loss_grad_func,
             equality_funcs=equality_funcs,
@@ -199,6 +199,8 @@ class ExternalOptimizerInterface:
             feed_dict=dict(zip(self._update_placeholders, var_vals)),
             **run_kwargs
         )
+
+        return res
 
     def _minimize(
         self,
@@ -258,12 +260,26 @@ class ExternalOptimizerInterface:
 
         def eval_func(x):
             """Function to evaluate a `Tensor`."""
-            augmented_feed_dict = {
-                var: x[packing_slice].reshape(_get_shape_tuple(var))
-                for var, packing_slice in zip(self._vars, self._packing_slices)
-            }
-            augmented_feed_dict.update(feed_dict)
+            # augmented_feed_dict = {
+            #     var: x[packing_slice].reshape(_get_shape_tuple(var))
+            #     for var, packing_slice in zip(self._vars, self._packing_slices)
+            # }
+            # augmented_feed_dict.update(feed_dict)
+            augmented_feed_dict = feed_dict
             augmented_fetches = tensors + fetches
+
+            # ================================================================
+            # =====   Instead of using feed_dict, just assign values to  =====
+            # =====   the network parameters directly! (221209 HyK)      =====
+            # ================================================================
+
+            var_vals = [x[packing_slice] for packing_slice in self._packing_slices]
+            session.run(
+                self._var_updates,
+                feed_dict=dict(zip(self._update_placeholders, var_vals)),
+            )
+
+            # ================================================================
 
             augmented_fetch_vals = session.run(
                 augmented_fetches, feed_dict=augmented_feed_dict
@@ -397,7 +413,7 @@ class ScipyOptimizerInterface(ExternalOptimizerInterface):
             message_args.append(result.nfev)
         tf.logging.info("\n".join(message_lines), *message_args)
 
-        return result["x"]
+        return result["x"], result
 
 
 def _accumulate(list_):

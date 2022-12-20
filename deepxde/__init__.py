@@ -25,12 +25,13 @@ from . import nn
 from . import utils
 
 from .backend import Variable
-from .model import Model
+from .model import Model, FSModel, FSModel_with_DD
 from .utils import saveplot
 
 # Backward compatibility
 from .icbc import (
     DirichletBC,
+    DirichletBC_xy,
     NeumannBC,
     OperatorBC,
     PeriodicBC,

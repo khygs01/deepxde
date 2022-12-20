@@ -100,7 +100,7 @@ class PDE(Data):
 
         self.auxiliary_var_fn = auxiliary_var_function
 
-        # TODO: train_x_all is used for PDE losses. It is better to add train_x_pde 
+        # TODO: train_x_all is used for PDE losses. It is better to add train_x_pde
         # explicitly.
         self.train_x_all = None
         self.train_x_bc = None
@@ -326,3 +326,202 @@ class TimePDE(PDE):
             X = np.vstack((tmp, X))
         self.train_x_all = X
         return X
+
+
+class FSPDE(PDE):
+    """
+    Modify losses method in original PDE class to include net_xy's output.
+    """
+
+    def __init__(
+        self,
+        geometry,
+        pde,
+        bcs,
+        num_domain=0,
+        num_boundary=0,
+        train_distribution="Hammersley",
+        anchors=None,
+        anchors_bc=None,
+        exclusions=None,
+        solution=None,
+        num_test=None,
+        auxiliary_var_function=None,
+    ):
+        self.anchors_bc = (
+            None if anchors_bc is None else anchors_bc.astype(config.real(np))
+        )
+        super().__init__(
+            geometry,
+            pde,
+            bcs,
+            num_domain,
+            num_boundary,
+            train_distribution=train_distribution,
+            anchors=anchors,
+            exclusions=exclusions,
+            solution=solution,
+            num_test=num_test,
+            auxiliary_var_function=auxiliary_var_function,
+        )
+
+    def losses_train(
+        self,
+        targets,
+        outputs,
+        loss_fn,
+        inputs,
+        model,
+        aux=None,
+        net=None,
+        outputs_xy=None,
+        e=False,
+    ):
+        """Return a list of losses for training dataset, i.e., constraints."""
+        return self.losses(
+            targets,
+            outputs,
+            loss_fn,
+            inputs,
+            model,
+            aux=aux,
+            net=net,
+            outputs_xy=outputs_xy,
+            e=e,
+        )
+
+    def losses_test(
+        self,
+        targets,
+        outputs,
+        loss_fn,
+        inputs,
+        model,
+        aux=None,
+        net=None,
+        outputs_xy=None,
+        e=False,
+    ):
+        """Return a list of losses for test dataset, i.e., constraints."""
+        return self.losses(
+            targets,
+            outputs,
+            loss_fn,
+            inputs,
+            model,
+            aux=aux,
+            net=net,
+            outputs_xy=outputs_xy,
+            e=e,
+        )
+
+    def losses(
+        self,
+        targets,
+        outputs,
+        loss_fn,
+        inputs,
+        model,
+        aux=None,
+        net=None,
+        outputs_xy=None,
+        e=False,
+    ):
+        """
+        targets: uvp_exact (tf.placeholder, net.y_)
+        outputs: uvp (tf.tensor, net.y)
+        inputs: xi (tf.placeholder, net.x)
+        access xy and xy_exact via model.net.ouputs_xy (tf.tensor, net.xy) and
+        model.net.targets_xy (tf.tensor, net.xy_)
+        net: use if there are more than one net (e.g. domain decomposition)
+        """
+        if backend_name == "tensorflow.compat.v1":
+            if net is not None:
+                outputs_xy = net.outputs_xy
+            else:
+                outputs_xy = model.net.outputs_xy
+        if backend_name in ["tensorflow.compat.v1", "tensorflow", "pytorch", "paddle"]:
+            outputs_uvp = outputs
+        elif backend_name == "jax":
+            # JAX requires pure functions
+            outputs_uvp = (outputs, aux[0])
+
+        f = []
+        if self.pde is not None:
+            if get_num_args(self.pde) == 2:
+                f = self.pde(inputs, outputs_uvp)
+            elif get_num_args(self.pde) == 3:
+                f = self.pde(inputs, outputs_uvp, outputs_xy)
+            if not isinstance(f, (list, tuple)):
+                f = [f]
+
+        if not isinstance(loss_fn, (list, tuple)):
+            loss_fn = [loss_fn] * (len(f) + len(self.bcs))
+        elif len(loss_fn) != len(f) + len(self.bcs):
+            raise ValueError(
+                "There are {} errors, but only {} losses.".format(
+                    len(f) + len(self.bcs), len(loss_fn)
+                )
+            )
+
+        bcs_start = np.cumsum([0] + self.num_bcs)
+        bcs_start = list(map(int, bcs_start))
+        errors = [fi[bcs_start[-1] :] for fi in f]
+        losses = [
+            loss_fn[i](bkd.zeros_like(error), error) for i, error in enumerate(errors)
+        ]
+        inner_n = len(f)
+        for i, bc in enumerate(self.bcs):
+            beg, end = bcs_start[i], bcs_start[i + 1]
+            # The same BC points are used for training and testing.
+            error = bc.error(self.train_x, inputs, outputs_uvp, beg, end, outputs_xy)
+            errors.append(error)
+            losses.append(loss_fn[inner_n + i](bkd.zeros_like(error), error))
+        if e:
+            return losses, errors
+        else:
+            return losses
+
+    @run_if_all_none("train_x_all")
+    def train_points(self):
+        X = np.empty((0, self.geom.dim), dtype=config.real(np))
+        if self.num_domain > 0:
+            if self.train_distribution == "uniform":
+                X = self.geom.uniform_points(self.num_domain, boundary=False)
+            else:
+                X = self.geom.random_points(
+                    self.num_domain, random=self.train_distribution
+                )
+        if self.num_boundary > 0:
+            if self.train_distribution == "uniform":
+                tmp = self.geom.uniform_boundary_points(self.num_boundary)
+            else:
+                tmp = self.geom.random_boundary_points(
+                    self.num_boundary, random=self.train_distribution
+                )
+            self._boundary_points = tmp
+        else:
+            self._boundary_points = np.empty((0, self.geom.dim), dtype=config.real(np))
+        if self.anchors_bc is not None:
+            self._boundary_points = np.vstack((self.anchors_bc, self._boundary_points))
+        if self.anchors is not None:
+            X = np.vstack((self.anchors, X))
+        if self.exclusions is not None:
+
+            def is_not_excluded(x):
+                return not np.any([np.allclose(x, y) for y in self.exclusions])
+
+            X = np.array(list(filter(is_not_excluded, X)))
+        self.train_x_all = X
+        return X
+
+    @run_if_all_none("train_x_bc")
+    def bc_points(self):
+        x_bcs = [bc.collocation_points(self._boundary_points) for bc in self.bcs]
+        self.num_bcs = list(map(len, x_bcs))
+        self.train_x_bc = (
+            np.vstack(x_bcs)
+            if x_bcs
+            else np.empty([0, self.train_x_all.shape[-1]], dtype=config.real(np))
+        )
+        return self.train_x_bc

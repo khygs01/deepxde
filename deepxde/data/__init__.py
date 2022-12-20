@@ -14,6 +14,7 @@ __all__ = [
     "MfDataSet",
     "MfFunc",
     "PDE",
+    "FSPDE",
     "PDEOperator",
     "PDEOperatorCartesianProd",
     "PowerSeries",
@@ -24,6 +25,8 @@ __all__ = [
     "Triple",
     "TripleCartesianProd",
     "wasserstein2",
+    "SharedBdry",
+    "FlowrateBdry",
 ]
 
 from .constraint import Constraint
@@ -35,8 +38,10 @@ from .function_spaces import Chebyshev, GRF, GRF_KL, GRF2D, PowerSeries, wassers
 from .func_constraint import FuncConstraint
 from .ide import IDE
 from .mf import MfDataSet, MfFunc
-from .pde import PDE, TimePDE
+from .pde import PDE, TimePDE, FSPDE
 from .pde_operator import PDEOperator, PDEOperatorCartesianProd
 from .quadruple import Quadruple, QuadrupleCartesianProd
 from .sampler import BatchSampler
 from .triple import Triple, TripleCartesianProd
+from .shared_bdry import SharedBdry
+from .flowrate_bdry import FlowrateBdry
