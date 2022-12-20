@@ -14,6 +14,7 @@ from . import optimizers
 from . import utils
 from .backend import backend_name, tf, torch, jax, paddle
 from .callbacks import CallbackList
+from .utils import list_to_str
 
 import time
 import os
@@ -272,6 +273,8 @@ class Model:
                 else:
                     inputs = torch.as_tensor(inputs)
                     inputs.requires_grad_()
+            # Clear cached Jacobians and Hessians.
+            grad.clear()
             return self.net(inputs)
 
         def outputs_losses(training, inputs, targets, losses_fn):
@@ -540,11 +543,16 @@ class Model:
         Args:
             iterations (Integer): Number of iterations to train the model, i.e., number
                 of times the network weights are updated.
-            batch_size: Integer or ``None``. If you solve PDEs via ``dde.data.PDE`` or
-                ``dde.data.TimePDE``, do not use `batch_size`, and instead use
-                `dde.callbacks.PDEResidualResampler
-                <https://deepxde.readthedocs.io/en/latest/modules/deepxde.html#deepxde.callbacks.PDEResidualResampler>`_,
-                see an `example <https://github.com/lululxvi/deepxde/blob/master/examples/diffusion_1d_resample.py>`_.
+            batch_size: Integer, tuple, or ``None``.
+
+                - If you solve PDEs via ``dde.data.PDE`` or ``dde.data.TimePDE``, do not use `batch_size`, and instead use
+                  `dde.callbacks.PDEResidualResampler
+                  <https://deepxde.readthedocs.io/en/latest/modules/deepxde.html#deepxde.callbacks.PDEResidualResampler>`_,
+                  see an `example <https://github.com/lululxvi/deepxde/blob/master/examples/diffusion_1d_resample.py>`_.
+                - For DeepONet in the format of Cartesian product, if `batch_size` is an Integer,
+                  then it is the batch size for the branch input; if you want to also use mini-batch for the trunk net input,
+                  set `batch_size` as a tuple, where the fist number is the batch size for the branch net input
+                  and the second number is the batch size for the trunk net input.
             display_every (Integer): Print the loss and metrics every this steps.
             disregard_previous_best: If ``True``, disregard the previous saved best
                 model.
@@ -561,7 +569,6 @@ class Model:
                 " Use iterations instead."
             )
             iterations = epochs
-
         self.batch_size = batch_size
         self.callbacks = CallbackList(callbacks=callbacks)
         self.callbacks.set_model(self)
@@ -629,17 +636,35 @@ class Model:
                 break
 
     def _train_tensorflow_compat_v1_scipy(self, display_every):
-        def loss_callback(loss_train):
+        def loss_callback(loss_train, loss_test, *args):
             self.train_state.epoch += 1
             self.train_state.step += 1
             if self.train_state.step % display_every == 0:
                 self.train_state.loss_train = loss_train
-                self.train_state.loss_test = None
+                self.train_state.loss_test = loss_test
                 self.train_state.metrics_test = None
                 self.losshistory.append(
-                    self.train_state.step, self.train_state.loss_train, None, None
+                    self.train_state.step,
+                    self.train_state.loss_train,
+                    self.train_state.loss_test,
+                    None,
                 )
                 display.training_display(self.train_state)
+            for cb in self.callbacks.callbacks:
+                if type(cb).__name__ == "VariableValue":
+                    cb.epochs_since_last += 1
+                    if cb.epochs_since_last >= cb.period:
+                        cb.epochs_since_last = 0
+
+                        print(
+                            cb.model.train_state.epoch,
+                            list_to_str(
+                                [float(arg) for arg in args],
+                                precision=cb.precision,
+                            ),
+                            file=cb.file,
+                        )
+                        cb.file.flush()
 
         self.train_state.set_data_train(*self.data.train_next_batch(self.batch_size))
         feed_dict = self.net.feed_dict(
@@ -648,10 +673,13 @@ class Model:
             self.train_state.y_train,
             self.train_state.train_aux_vars,
         )
+        fetches = [self.outputs_losses_train[1], self.outputs_losses_test[1]]
+        if self.external_trainable_variables:
+            fetches += self.external_trainable_variables
         self.train_step.minimize(
             self.sess,
             feed_dict=feed_dict,
-            fetches=[self.outputs_losses_train[1]],
+            fetches=fetches,
             loss_callback=loss_callback,
         )
         self._test()
@@ -826,6 +854,8 @@ class Model:
                     "Model.predict() with auxiliary variable hasn't been implemented "
                     "for backend pytorch."
                 )
+            # Clear cached Jacobians and Hessians.
+            grad.clear()
             y = utils.to_numpy(y)
         elif backend_name == "paddle":
             self.net.eval()

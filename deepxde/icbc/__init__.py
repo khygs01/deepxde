@@ -11,6 +11,7 @@ __all__ = [
     "OperatorBC_uvpxy",
     "FlowRateBC",
     "PointSetBC",
+    "PointSetOperatorBC",
     "IC",
     "SharedBdryBC",
     "SharedBdryResidualBC",
@@ -33,5 +34,6 @@ from .boundary_conditions import (
     SharedBdryResidualBC,
     SharedBdryUVPBC,
     SharedBdryXYBC,
+    PointSetOperatorBC,
 )
 from .initial_conditions import IC
